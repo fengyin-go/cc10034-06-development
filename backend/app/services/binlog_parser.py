@@ -35,7 +35,9 @@ class BinlogParserService(BaseModuleService):
         parse_mode = config.get("解析模式", "ROW")
 
         # 字符集编码校验
-        event_id = f"evt_{uuid.uuid4().hex[:12]}_{int(time.time())}"
+        # event_id 优先沿用解析输入携带的稳定身份（来源坐标），缺失时才生成临时ID，
+        # 保证同一批 Binlog 行重复解析、重复导出时成员身份稳定。
+        event_id = raw_row.get("event_id") or f"evt_{uuid.uuid4().hex[:12]}_{int(time.time())}"
         tx_id = raw_row.get("tx_id", f"tx_{uuid.uuid4().hex[:8]}")
         operation = raw_row.get("op", "INSERT")
         before = raw_row.get("before") if operation in ("UPDATE", "DELETE") else None
@@ -43,6 +45,7 @@ class BinlogParserService(BaseModuleService):
         columns = list(after.keys()) if after else (list(before.keys()) if before else [])
 
         changetable = raw_row.get("table", source_db.split(".")[-1] if "." in source_db else "unknown_table")
+        # binlog_file / binlog_pos 是数据库提交边界的来源坐标，逐行透传，不做默认改写。
         binlog_file = raw_row.get("binlog_file", f"mysql-bin.{(int(time.time()/3600) % 1000):06d}")
         binlog_pos = int(raw_row.get("binlog_pos", 0))
         gtid = raw_row.get("gtid", "")
@@ -71,19 +74,63 @@ class BinlogParserService(BaseModuleService):
         )
         return event
 
+    def parse_boundary_event(self, config: dict[str, Any], raw_row: dict[str, Any]) -> dict[str, Any]:
+        """解析事务边界事件（XID/COMMIT/ROLLBACK），登记事务提交坐标。
+
+        边界事件本身不是变更成员，只负责把 binlog_file/binlog_pos 记录为
+        对应事务的提交位点。变更成员与提交位点来自同一条 Binlog 流，坐标口径一致。
+        """
+        boundary = (raw_row.get("boundary") or raw_row.get("op") or "").upper()
+        tx_id = raw_row.get("tx_id", "")
+        binlog_file = raw_row.get("binlog_file", "")
+        binlog_pos = int(raw_row.get("binlog_pos", 0))
+        gtid = raw_row.get("gtid", "")
+        if boundary in ("XID", "COMMIT"):
+            group = pipeline_bus.mark_transaction_commit(tx_id, binlog_file, binlog_pos, gtid)
+            result_state = group.state if group else "COMMITTED"
+            pipeline_bus.write_audit(
+                "事务提交", tx_id,
+                f"事务 {tx_id} 提交边界 {binlog_file}:{binlog_pos}",
+                "binlog_parser", "已记录"
+            )
+        elif boundary in ("ROLLBACK",):
+            group = pipeline_bus.mark_transaction_rollback(tx_id, binlog_file, binlog_pos)
+            result_state = group.state if group else "ROLLED_BACK"
+            pipeline_bus.write_audit(
+                "事务回滚", tx_id,
+                f"事务 {tx_id} 回滚边界 {binlog_file}:{binlog_pos}",
+                "binlog_parser", "已记录"
+            )
+        else:
+            return {"tx_id": tx_id, "accepted": False, "reason": f"未知边界类型：{boundary}"}
+        return {
+            "tx_id": tx_id,
+            "accepted": True,
+            "state": result_state,
+            "binlog_file": binlog_file,
+            "binlog_pos": binlog_pos,
+        }
+
     def parse_batch(self, config: dict[str, Any], raw_rows: list[dict[str, Any]]) -> dict[str, Any]:
         """批量解析 Binlog 行，产出统计摘要。
 
         批量模式的每个事件通过 publish_event 推入管道，
-        下游 change_event 消费端自动可见。
+        下游 change_event 消费端自动可见；边界行（XID/COMMIT/ROLLBACK）
+        只登记事务提交坐标，不产出变更成员。
         """
         events: list[ChangeEventRecord] = []
+        boundaries = 0
         errors = 0
         fiter_rule = config.get("过滤规则", "")
         for row in raw_rows:
             if fiter_rule and fiter_rule not in str(row):
                 continue
+            kind = (row.get("boundary") or row.get("op") or "").upper()
             try:
+                if kind in ("XID", "COMMIT", "ROLLBACK"):
+                    self.parse_boundary_event(config, row)
+                    boundaries += 1
+                    continue
                 evt = self.parse_binlog_row(config, row)
                 events.append(evt)
             except Exception:
@@ -92,6 +139,7 @@ class BinlogParserService(BaseModuleService):
         return {
             "config": config.get("配置名称"),
             "total": len(events),
+            "boundaries": boundaries,
             "errors": errors,
             "ids": [e.event_id for e in events[-5:]],
             "last_pos": events[-1].binlog_pos if events else 0,

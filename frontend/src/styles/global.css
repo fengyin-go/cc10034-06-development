@@ -70,3 +70,22 @@ body { margin: 0; background: #f6f8fb; color: #1f2937; }
 .analysis-chart { display: flex; align-items: flex-end; gap: 8px; height: 160px; padding: 12px 0; }
 .analysis-bar { flex: 1; border-radius: 4px 4px 0 0; background: var(--brand); min-width: 24px; position: relative; transition: height 0.4s; }
 .analysis-bar span { position: absolute; bottom: -20px; left: 50%; transform: translateX(-50%); font-size: 10px; color: var(--muted); white-space: nowrap; }
+/* 事务包下载与回放面板 */
+.tx-panel { margin-top: 24px; background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.tx-panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.tx-panel-head h3 { margin: 0 0 4px; font-size: 15px; }
+.file-btn { display: inline-flex; align-items: center; cursor: pointer; }
+.tx-open { color: #b45309; }
+.watermark { font-size: 14px; font-family: monospace; }
+.tx-state { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+.tx-state-COMMITTED { background: #dcfce7; color: #15803d; }
+.tx-state-OPEN { background: #fef3c7; color: #b45309; }
+.tx-state-ROLLED_BACK { background: #fee2e2; color: #b91c1c; }
+.replay-message { padding: 8px 12px; border-radius: 6px; background: #eff6ff; color: #1e40af; font-size: 13px; }
+.replay-message.replay-error { background: #fef2f2; color: #b91c1c; }
+.tx-detail-modal { width: min(880px, 100%); }
+.tx-detail-grid { display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; margin: 8px 0 12px; }
+.tx-detail-grid dt { font-size: 12px; color: var(--muted); }
+.tx-detail-grid dd { margin: 0; font-size: 13px; }
+.tx-detail-modal h4 { margin: 14px 0 6px; font-size: 13px; }
+.modal-actions { margin-top: 14px; justify-content: flex-end; }

@@ -65,6 +65,117 @@ class CheckpointRecord:
     data_checksum: str
 
 
+@dataclass
+class TransactionMember:
+    """事务成员：同一事务内按 Binlog 顺序排列的一条变更事件。
+
+    member_key 由成员自身的来源坐标与事件身份确定性派生，
+    保证同一事件无论落在哪一次导出，身份都保持稳定。
+    """
+    member_key: str
+    event_id: str
+    source_db: str
+    source_table: str
+    operation: str
+    binlog_file: str
+    binlog_pos: int
+    event_time: str
+    before_image: dict[str, Any] | None = None
+    after_image: dict[str, Any] | None = None
+    gtid: str = ""
+    raw_format: str = "debezium"
+    seq: int = 0
+
+    @staticmethod
+    def build_key(event_id: str, binlog_file: str, binlog_pos: int) -> str:
+        raw = f"{event_id}|{binlog_file}|{binlog_pos}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def from_event(cls, event: ChangeEventRecord, seq: int) -> "TransactionMember":
+        return cls(
+            member_key=cls.build_key(event.event_id, event.binlog_file, event.binlog_pos),
+            event_id=event.event_id,
+            source_db=event.source_db,
+            source_table=event.source_table,
+            operation=event.operation,
+            binlog_file=event.binlog_file,
+            binlog_pos=event.binlog_pos,
+            event_time=event.event_time.isoformat(),
+            before_image=event.before_image,
+            after_image=event.after_image,
+            gtid=event.gtid,
+            raw_format=event.raw_format,
+            seq=seq,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "member_key": self.member_key,
+            "seq": self.seq,
+            "event_id": self.event_id,
+            "source_db": self.source_db,
+            "source_table": self.source_table,
+            "operation": self.operation,
+            "binlog_file": self.binlog_file,
+            "binlog_pos": self.binlog_pos,
+            "event_time": self.event_time,
+            "before_image": self.before_image,
+            "after_image": self.after_image,
+            "gtid": self.gtid,
+            "raw_format": self.raw_format,
+        }
+
+
+@dataclass
+class TransactionGroup:
+    """事务归并组：按事务ID聚合的变更集合，携带完整提交边界。
+
+    只有收到显式提交边界（Xid/COMMIT）后 state 才是 COMMITTED；
+    观察窗结束而 commit 未到时保持 OPEN，绝不伪装成完整明细。
+    """
+    tx_id: str
+    state: str  # OPEN / COMMITTED / ROLLED_BACK
+    members: list[TransactionMember] = field(default_factory=list)
+    begin_file: str = ""
+    begin_pos: int = 0
+    commit_file: str = ""
+    commit_pos: int | None = None
+    gtid: str = ""
+    first_seen: str = ""
+    last_seen: str = ""
+    tx_key: str = ""
+
+    @staticmethod
+    def build_tx_key(tx_id: str, begin_file: str, begin_pos: int) -> str:
+        raw = f"{tx_id}|{begin_file}|{begin_pos}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def recompute_tx_key(self) -> str:
+        self.tx_key = self.build_tx_key(self.tx_id, self.begin_file, self.begin_pos)
+        return self.tx_key
+
+    def to_dict(self, include_members: bool = True) -> dict[str, Any]:
+        data = {
+            "tx_key": self.tx_key,
+            "tx_id": self.tx_id,
+            "state": self.state,
+            "member_count": len(self.members),
+            "begin": {"binlog_file": self.begin_file, "binlog_pos": self.begin_pos},
+            "commit": (
+                {"binlog_file": self.commit_file, "binlog_pos": self.commit_pos}
+                if self.state == "COMMITTED" and self.commit_pos is not None
+                else None
+            ),
+            "gtid": self.gtid,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+        }
+        if include_members:
+            data["members"] = [m.to_dict() for m in self.members]
+        return data
+
+
 class PipelineBus:
     """管道级事件总线：持有事件队列、Schema 注册表、位点注册表、SCD 状态存储。
 
@@ -115,6 +226,14 @@ class PipelineBus:
             "dedup_hits": 0,
             "backfill_rows": 0,
         }
+        # 事务归并表 — change_event 消费后按事务ID聚合，导出与事务明细共用同一数据源
+        self.transactions: dict[str, TransactionGroup] = {}
+        self.tx_order: list[str] = []
+        # 导出批次登记表 — 每次事务包导出的观察窗与实际囊括范围
+        self.export_batches: list[dict[str, Any]] = []
+        # 回放（导入）登记表 — 已应用事务的稳定身份，支撑重复导入幂等
+        self.replayed_tx_keys: dict[str, dict[str, Any]] = {}
+        self.replay_runs: list[dict[str, Any]] = []
 
     def publish_event(self, event: ChangeEventRecord) -> dict[str, Any]:
         """将解析产出的事件发布到队列。返回发布确认。"""
@@ -135,6 +254,127 @@ class PipelineBus:
         self.pipeline_metrics["total_output"] += len(batch)
         return batch
 
+    # ------------------------------------------------------------------
+    # 事务边界：归并、提交、回滚
+    # ------------------------------------------------------------------
+    def merge_transaction_event(self, event: ChangeEventRecord) -> TransactionGroup:
+        """把一条已消费的变更事件按事务ID归并到事务组。
+
+        事务起点坐标取该事务第一条变更的 (binlog_file, binlog_pos)，
+        事务身份 tx_key 由事务ID与起点坐标确定性派生，重复导出保持不变。
+        """
+        group = self.transactions.get(event.tx_id)
+        if group is None:
+            group = TransactionGroup(
+                tx_id=event.tx_id,
+                state="OPEN",
+                begin_file=event.binlog_file,
+                begin_pos=event.binlog_pos,
+                gtid=event.gtid,
+                first_seen=event.event_time.isoformat(),
+            )
+            self.transactions[event.tx_id] = group
+            self.tx_order.append(event.tx_id)
+        elif not group.members:
+            # 边界事件先到达时建立的空壳组：起点坐标与首见时间由第一条成员补齐，
+            # 不能沿用提交事件坐标充当事务起点。
+            group.begin_file = event.binlog_file
+            group.begin_pos = event.binlog_pos
+            group.first_seen = event.event_time.isoformat()
+        member = TransactionMember.from_event(event, seq=len(group.members) + 1)
+        # 同一来源坐标的成员重复归并（重复解析/重复消费）时保持成员集合稳定，
+        # 不追加重复成员，稳定身份不随解析次数变化。
+        if any(existing.member_key == member.member_key for existing in group.members):
+            group.last_seen = event.event_time.isoformat()
+            return group
+        group.members.append(member)
+        group.last_seen = event.event_time.isoformat()
+        if event.gtid and not group.gtid:
+            group.gtid = event.gtid
+        group.recompute_tx_key()
+        return group
+
+    def mark_transaction_commit(
+        self, tx_id: str, binlog_file: str, binlog_pos: int, gtid: str = "",
+    ) -> TransactionGroup | None:
+        """登记事务提交边界（Xid/COMMIT 事件坐标）。
+
+        提交坐标必须显式记录；未收到提交边界的事务永远保持 OPEN。
+        """
+        group = self.transactions.get(tx_id)
+        if group is None:
+            # 提交先于变更成员到达（理论上不会发生），建立空壳 OPEN 组等待成员补齐
+            group = TransactionGroup(
+                tx_id=tx_id, state="OPEN",
+                first_seen=datetime.now().isoformat(),
+                last_seen=datetime.now().isoformat(),
+            )
+            self.transactions[tx_id] = group
+            self.tx_order.append(tx_id)
+        group.state = "COMMITTED"
+        group.commit_file = binlog_file
+        group.commit_pos = int(binlog_pos)
+        if gtid:
+            group.gtid = gtid
+        # 空壳组（边界先于成员到达）的起点坐标留给首条成员补齐，
+        # 这里不用提交坐标冒充事务起点。
+        group.last_seen = datetime.now().isoformat()
+        group.recompute_tx_key()
+        return group
+
+    def mark_transaction_rollback(
+        self, tx_id: str, binlog_file: str, binlog_pos: int,
+    ) -> TransactionGroup | None:
+        """登记事务回滚边界：回滚事务不进入可回放明细。
+
+        边界先于成员消费到达时建立 ROLLED_BACK 空壳组，后续成员归并不会复活状态。
+        """
+        group = self.transactions.get(tx_id)
+        if group is None:
+            group = TransactionGroup(
+                tx_id=tx_id, state="ROLLED_BACK",
+                commit_file=binlog_file, commit_pos=int(binlog_pos),
+                first_seen=datetime.now().isoformat(),
+                last_seen=datetime.now().isoformat(),
+            )
+            self.transactions[tx_id] = group
+            self.tx_order.append(tx_id)
+            group.recompute_tx_key()
+            return group
+        group.state = "ROLLED_BACK"
+        group.commit_file = binlog_file
+        group.commit_pos = int(binlog_pos)
+        group.recompute_tx_key()
+        return group
+
+    def list_transactions(self) -> list[TransactionGroup]:
+        return [self.transactions[tx_id] for tx_id in self.tx_order if tx_id in self.transactions]
+
+    def get_transaction(self, tx_key: str) -> TransactionGroup | None:
+        for group in self.transactions.values():
+            if group.tx_key == tx_key:
+                return group
+        return None
+
+    def high_watermark(self) -> tuple[str, int]:
+        """当前已消费事件流的最高坐标（观察窗结束位置）。"""
+        last_file, last_pos = "", 0
+        for group in self.list_transactions():
+            for member in group.members:
+                if (member.binlog_file, member.binlog_pos) > (last_file, last_pos):
+                    last_file, last_pos = member.binlog_file, member.binlog_pos
+            if group.commit_pos is not None and (group.commit_file, group.commit_pos) > (last_file, last_pos):
+                last_file, last_pos = group.commit_file, group.commit_pos
+        return last_file, last_pos
+
+    def register_export_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """登记一次事务包导出的观察窗与实际囊括的事务范围。"""
+        batch_no = len(self.export_batches) + 1
+        record = {"batch_no": batch_no, "exported_at": datetime.now().isoformat(), **batch}
+        self.export_batches.append(record)
+        return record
+
+    # ------------------------------------------------------------------
     def register_position(self, pos: PositionSnapshot) -> None:
         """注册存储位点。"""
         self.positions[pos.instance] = pos
@@ -315,6 +555,8 @@ class PipelineBus:
 
     def snapshot(self) -> dict[str, Any]:
         """全管道状态快照。"""
+        committed = sum(1 for g in self.transactions.values() if g.state == "COMMITTED")
+        open_tx = sum(1 for g in self.transactions.values() if g.state == "OPEN")
         return {
             "parse_stats": dict(self.parse_stats),
             "pipeline_metrics": dict(self.pipeline_metrics),
@@ -328,6 +570,11 @@ class PipelineBus:
             "scd_type3_keys": len(self.scd_type3_store),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
+            "tx_total": len(self.transactions),
+            "tx_committed": committed,
+            "tx_open": open_tx,
+            "export_batch_count": len(self.export_batches),
+            "replayed_tx_count": len(self.replayed_tx_keys),
         }
 
 
